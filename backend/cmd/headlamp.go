@@ -640,21 +640,13 @@ func createHeadlampHandler(ctx context.Context, config *HeadlampConfig) http.Han
 			reader = resp.Body
 		}
 
-		respBody, err := io.ReadAll(reader)
-		if err != nil {
-			logger.Log(logger.LevelError, nil, err, "reading response")
-			http.Error(w, err.Error(), http.StatusBadGateway)
-
-			return
-		}
-
 		if contentType := resp.Header.Get("Content-Type"); contentType != "" {
 			w.Header().Set("Content-Type", contentType)
 		}
 
 		w.WriteHeader(resp.StatusCode)
 
-		_, err = w.Write(respBody)
+		_, err = io.Copy(w, reader)
 		if err != nil {
 			logger.Log(logger.LevelError, nil, err, "writing response")
 
@@ -1203,6 +1195,7 @@ func hostValidationMiddleware(listenAddr string, port uint) func(http.Handler) h
 	}
 }
 
+//nolint:funlen
 func StartHeadlampServer(config *HeadlampConfig) {
 	tel, err := initTelemetry(config)
 	if err != nil {
@@ -1247,8 +1240,12 @@ func StartHeadlampServer(config *HeadlampConfig) {
 
 	listenHost := strings.TrimPrefix(strings.TrimSuffix(config.ListenAddr, "]"), "[")
 	addr := net.JoinHostPort(listenHost, fmt.Sprintf("%d", config.Port))
-
-	server := &http.Server{Addr: addr, Handler: handler} //nolint:gosec
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
 	serverDone := make(chan struct{})
 	setupGracefulShutdown(server, cancel, serverDone)
