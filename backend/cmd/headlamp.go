@@ -148,6 +148,11 @@ const ContextUpdateCacheTTL = 20 * time.Second // seconds
 
 const JWTExpirationTTL = 10 * time.Second // seconds
 
+// OidcStateTTL is the maximum time an OIDC state token is kept in memory
+// waiting for the callback. Entries that are never completed (e.g. the user
+// closed the tab) are evicted after this duration to prevent unbounded growth.
+const OidcStateTTL = 10 * time.Minute
+
 const (
 	// serverReadHeaderTimeout is the maximum time to read the request headers.
 	serverReadHeaderTimeout = 10 * time.Second
@@ -214,6 +219,7 @@ type OauthConfig struct {
 	Ctx          context.Context
 	CodeVerifier string // PKCE code verifier
 	Cluster      string // cluster context name this is associated with
+	createdAt    time.Time
 }
 
 // returns True if a file exists.
@@ -589,17 +595,21 @@ func createHeadlampHandler(ctx context.Context, config *HeadlampConfig) http.Han
 	logger.Log(logger.LevelInfo, nil, nil, "Dynamic clusters support: "+fmt.Sprint(config.EnableDynamicClusters))
 	logger.Log(logger.LevelInfo, nil, nil, "Helm support: "+fmt.Sprint(config.EnableHelm))
 	logger.Log(logger.LevelInfo, nil, nil, "Proxy URLs: "+fmt.Sprint(config.ProxyURLs))
+	config.proxyURLMu.Lock()
 	proxyURLAllowlist := config.compiledProxyURLs
 	if proxyURLAllowlist == nil {
 		var err error
 
 		proxyURLAllowlist, err = compileProxyURLPatterns(config.ProxyURLs)
 		if err != nil {
-			panic(err)
+			logger.Log(logger.LevelError, nil, nil,
+				"Invalid ProxyURLs configuration; disabling /externalproxy: "+err.Error())
+			proxyURLAllowlist = []proxyURLAllowlistEntry{}
 		}
 
 		config.compiledProxyURLs = proxyURLAllowlist
 	}
+	config.proxyURLMu.Unlock()
 	logger.Log(logger.LevelInfo, nil, nil, "TLS certificate path: "+config.TLSCertPath)
 	logger.Log(logger.LevelInfo, nil, nil, "TLS key path: "+config.TLSKeyPath)
 	logger.Log(logger.LevelInfo, nil, nil, "me Username Paths: "+config.MeUsernamePaths)
@@ -754,9 +764,10 @@ func createHeadlampHandler(ctx context.Context, config *HeadlampConfig) http.Han
 		}
 
 		if _, ok := matchProxyURLAllowlist(targetURL.String(), proxyURLAllowlist); !ok {
+			denyErr := errors.New("no allowed proxy url match, request denied")
 			logger.Log(logger.LevelError, map[string]string{"proxyURL": targetURL.Redacted()},
-				err, "no allowed proxy url match, request denied")
-			http.Error(w, "no allowed proxy url match, request denied ", http.StatusBadRequest)
+				denyErr, "no allowed proxy url match, request denied")
+			http.Error(w, "no allowed proxy url match, request denied", http.StatusBadRequest)
 
 			return
 		}
@@ -889,6 +900,33 @@ func createHeadlampHandler(ctx context.Context, config *HeadlampConfig) http.Han
 		oauthMu         sync.Mutex
 	)
 
+	// Evict OIDC state entries that were never completed (e.g. the user closed
+	// the browser tab before finishing the auth flow). Without this, every
+	// abandoned /oidc request would leak an OauthConfig in memory forever.
+	go func() {
+		ticker := time.NewTicker(OidcStateTTL / 2)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				cutoff := time.Now().Add(-OidcStateTTL)
+
+				oauthMu.Lock()
+
+				for state, entry := range oauthRequestMap {
+					if entry.createdAt.Before(cutoff) {
+						delete(oauthRequestMap, state)
+					}
+				}
+
+				oauthMu.Unlock()
+			}
+		}
+	}()
+
 	r.HandleFunc("/oidc", func(w http.ResponseWriter, r *http.Request) {
 		ctx := context.Background()
 		cluster := r.URL.Query().Get("cluster")
@@ -991,10 +1029,11 @@ func createHeadlampHandler(ctx context.Context, config *HeadlampConfig) http.Han
 		}
 
 		entry := &OauthConfig{
-			Config:   oauthConfig,
-			Verifier: verifier,
-			Ctx:      ctx,
-			Cluster:  cluster,
+			Config:    oauthConfig,
+			Verifier:  verifier,
+			Ctx:       ctx,
+			Cluster:   cluster,
+			createdAt: time.Now(),
 		}
 
 		var authURL string
