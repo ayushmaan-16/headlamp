@@ -510,15 +510,14 @@ export function useKubeObjectList<K extends KubeObject>({
     { cluster: string; namespace?: string; resourceVersion: string }[]
   >([]);
 
+  const currentlyWatchedKeys = useMemo(
+    () => new Set(listsToWatch.map(w => `${w.cluster}:${w.namespace || ''}`)),
+    [listsToWatch]
+  );
+
   const listsNotYetWatched = query.data
     .filter(Boolean)
-    .filter(
-      data =>
-        listsToWatch.find(
-          // resourceVersion is intentionally omitted to avoid recreating WS connection when list is updated
-          watching => watching.cluster === data?.cluster && watching.namespace === data.namespace
-        ) === undefined
-    )
+    .filter(data => !currentlyWatchedKeys.has(`${data!.cluster}:${data!.namespace || ''}`))
     .map(data => ({
       cluster: data!.cluster,
       namespace: data!.namespace,
@@ -529,15 +528,22 @@ export function useKubeObjectList<K extends KubeObject>({
     setListsToWatch([...listsToWatch, ...listsNotYetWatched]);
   }
 
-  const listsToStopWatching = listsToWatch.filter(
-    watching =>
-      requests.find(request => {
-        if (watching.cluster !== request?.cluster) return false;
-        return !request.namespaces?.length
-          ? !watching.namespace
-          : !!watching.namespace && request.namespaces.includes(watching.namespace);
-      }) === undefined
-  );
+  const requestMap = useMemo(() => {
+    const map = new Map<string, Set<string> | null>();
+    requests.forEach(req => {
+      if (req.cluster)
+        map.set(req.cluster, req.namespaces?.length ? new Set(req.namespaces) : null);
+    });
+    return map;
+  }, [requests]);
+
+  const listsToStopWatching = listsToWatch.filter(watching => {
+    const allowed = requestMap.get(watching.cluster);
+    if (allowed === undefined) return true;
+    return allowed === null
+      ? !!watching.namespace
+      : !watching.namespace || !allowed.has(watching.namespace);
+  });
 
   if (listsToStopWatching.length > 0) {
     setListsToWatch(listsToWatch.filter(it => !listsToStopWatching.includes(it)));
